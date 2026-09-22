@@ -1,40 +1,30 @@
-"""The synchronous :class:`LevantoClient` and asynchronous
-:class:`AsyncLevantoClient`.
+"""The sync :class:`LevantoClient` and async :class:`AsyncLevantoClient`.
 
-Both share an identical public surface and delegate all request building,
-serialization, parsing, error mapping and retry policy to :mod:`levanto._http`;
-only the transport call and the sleep primitive differ between them.
+Both expose the same methods; everything except the transport loop is shared
+through :mod:`levanto._core`.
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Sequence, Union, overload
+from typing import Any, Dict, List, Sequence, overload
 
 import httpx
 
-from . import _http
+from . import _core
 from .errors import LevantoError
-from .questions import (
-    Choice,
-    Grounding,
-    OptionInput,
-    Question,
-    LevelInput,
-    Scale,
-    Sort,
-    Tags,
-    TagInput,
-    YesNo,
-)
+from .questions import Choice, Grounding, LevelInput, OptionInput, Question, Scale, Sort, Tags, TagInput, YesNo
 from .types import (
-    BatchItem,
+    BatchResult,
     ChoiceResult,
     Content,
     Envelope,
     GroupResult,
+    GroupsResult,
+    Reasoning,
     ScaleResult,
     SortResult,
     TagsResult,
@@ -43,49 +33,60 @@ from .types import (
 
 __all__ = ["LevantoClient", "AsyncLevantoClient", "Group"]
 
-DEFAULT_BASE_URL = "https://sage.levanto.ai"
+_UNSET: Any = object()
 
 
 @dataclass
 class Group:
-    """A shared document plus the questions to ask about it (one batch group).
-
-    Pass a list of these to :meth:`LevantoClient.decide_groups` to score
-    several documents, each with their own questions, in one round-trip.
-    """
+    """One document plus the questions to ask about it, for :meth:`LevantoClient.decide_groups`."""
 
     document: Content
     questions: Sequence[Question] = field(default_factory=list)
 
 
-def _is_batch(question: Union[Question, Sequence[Question]]) -> bool:
-    return isinstance(question, (list, tuple))
+def _api_key(api_key: str | None) -> str:
+    key = api_key or os.environ.get("LEVANTO_API_KEY")
+    if not key:
+        raise LevantoError("No API key: pass api_key= or set LEVANTO_API_KEY.")
+    return key
 
 
-class LevantoClient:
-    """Synchronous client for the Levanto Sage decision API."""
+class _Base:
+    _reasoning: Reasoning | None
+
+    def _pick(self, reasoning: Any) -> Reasoning | None:
+        return self._reasoning if reasoning is _UNSET else reasoning
+
+
+class LevantoClient(_Base):
+    """Client for the Levanto Sage decision API.
+
+    ``reasoning`` sets the default for every call (``"auto"``, ``"off"``, or
+    ``"on"``); leave it ``None`` for the server default (``"auto"``). Each
+    method also takes ``reasoning=`` to override it for one call.
+    """
 
     def __init__(
         self,
-        api_key: str,
+        api_key: str | None = None,
         *,
-        base_url: str = DEFAULT_BASE_URL,
+        base_url: str = _core.DEFAULT_BASE_URL,
         timeout: float = 60.0,
         max_retries: int = 3,
-        transport: Optional[httpx.BaseTransport] = None,
+        reasoning: Reasoning | None = None,
+        transport: httpx.BaseTransport | None = None,
     ) -> None:
+        self._reasoning = reasoning
         self._max_retries = max_retries
-        self._client = httpx.Client(
+        self._http = httpx.Client(
             base_url=base_url.rstrip("/"),
             timeout=timeout,
-            headers=_http.default_headers(api_key),
+            headers=_core.headers(_api_key(api_key)),
             transport=transport,
         )
 
-    # -- lifecycle -------------------------------------------------------- #
-
     def close(self) -> None:
-        self._client.close()
+        self._http.close()
 
     def __enter__(self) -> "LevantoClient":
         return self
@@ -93,107 +94,77 @@ class LevantoClient:
     def __exit__(self, *exc: Any) -> None:
         self.close()
 
-    # -- transport -------------------------------------------------------- #
-
-    def _request(
-        self,
-        method: str,
-        url: str,
-        *,
-        json: Any = None,
-        retry_statuses: bool = True,
-    ) -> httpx.Response:
+    def _send(self, method: str, path: str, body: Any = None, *, retry: bool = True) -> httpx.Response:
         attempt = 0
         while True:
             try:
-                response = self._client.request(method, url, json=json)
+                response = self._http.request(method, path, json=body)
+            except httpx.TimeoutException as exc:
+                raise LevantoError(f"{method} {path} timed out: {exc}") from exc
             except httpx.TransportError as exc:
-                if attempt < self._max_retries:
-                    time.sleep(_http.backoff_delay(attempt))
+                if retry and attempt < self._max_retries:
+                    time.sleep(_core.backoff_delay(attempt))
                     attempt += 1
                     continue
-                # Wrap the raw httpx error so callers only ever see LevantoError
-                # (mirrors the JS client, which wraps transport failures too).
-                raise LevantoError(f"Request to {url} failed: {exc}") from exc
-            if retry_statuses and _http.should_retry(
-                response.status_code, attempt, self._max_retries
-            ):
-                time.sleep(_http.backoff_delay(attempt))
+                raise LevantoError(f"{method} {path} failed: {exc}") from exc
+            if retry and _core.should_retry(response.status_code, attempt, self._max_retries):
+                time.sleep(_core.backoff_delay(attempt, response))
                 attempt += 1
                 continue
             return response
 
-    # -- core ------------------------------------------------------------- #
+    def _post(self, path: str, body: Dict[str, Any]) -> Any:
+        return _core.raise_for_status(self._send("POST", path, body))
 
     @overload
-    def decide(self, document: Content, question: Question) -> Envelope: ...
-
+    def decide(self, document: Content, question: Question, *, reasoning: Reasoning | None = ...) -> Envelope: ...
     @overload
     def decide(
-        self, document: Content, question: Sequence[Question]
-    ) -> List[BatchItem]: ...
+        self, document: Content, question: Sequence[Question], *, reasoning: Reasoning | None = ...
+    ) -> BatchResult: ...
+    def decide(self, document: Content, question: Any, *, reasoning: Any = _UNSET) -> Any:
+        """One question: ``POST /decide``, returns the :class:`Envelope`.
 
-    def decide(
-        self, document: Content, question: Union[Question, Sequence[Question]]
-    ) -> Union[Envelope, List[BatchItem]]:
-        """Make one decision, or a batch of decisions over the same document.
-
-        A single :class:`~levanto.questions.Question` returns the full
-        :class:`~levanto.types.Envelope`; a list/tuple of questions calls
-        ``/decide/batch`` and returns a list of
-        :class:`~levanto.types.BatchItem` aligned to input order.
+        A list of questions about the same document: one ``POST /decide/batch``
+        call (the document is sent once), returns a :class:`BatchResult`: one
+        :class:`BatchItem` per question, in order, plus the call's ``.meta``
+        (usage and latency are reported there, not per item).
         """
+        if isinstance(question, (list, tuple)):
+            data = self._post("/decide/batch", _core.build_batch_body([(document, question)], self._pick(reasoning)))
+            return BatchResult(_core.parse_batch([question], data)[0], _core.batch_meta(data))
+        return self._post("/decide", _core.build_single_body(document, question, self._pick(reasoning)))
 
-        if _is_batch(question):
-            questions = list(question)  # type: ignore[arg-type]
-            body = _http.build_batch_body(document, questions)
-            response = self._request("POST", "/decide/batch", json=body)
-            data = _http.handle_response(response)
-            return _http.parse_batch(questions, data)
+    def decide_groups(self, groups: Sequence[Group], *, reasoning: Reasoning | None = _UNSET) -> GroupsResult:
+        """Several documents, each with its own questions, in one ``POST /decide/batch`` call.
 
-        body = _http.build_single_body(document, question)  # type: ignore[arg-type]
-        response = self._request("POST", "/decide", json=body)
-        data = _http.handle_response(response)
-        return _http.parse_single(data)
-
-    def decide_groups(self, groups: Sequence[Group]) -> List[GroupResult]:
-        """Score several documents in one round-trip, each with its own questions.
-
-        Returns one :class:`~levanto.types.GroupResult` per input group, in
-        order; each group's ``items`` are the flattened
-        :class:`~levanto.types.BatchItem`s for that group's questions (the same
-        shape :meth:`decide` returns for a list of questions).
+        Returns one :class:`GroupResult` per group, in order, plus the call's ``.meta``.
         """
-
-        glist = list(groups)
-        body = _http.build_groups_body([(g.document, g.questions) for g in glist])
-        response = self._request("POST", "/decide/batch", json=body)
-        data = _http.handle_response(response)
-        results = data.get("results", [])
-        out: List[GroupResult] = []
-        for i, g in enumerate(glist):
-            grp = results[i] if i < len(results) else {}
-            out.append({"items": _http.parse_group_answers(list(g.questions), grp)})
-        return out
+        groups = list(groups)
+        body = _core.build_batch_body([(g.document, g.questions) for g in groups], self._pick(reasoning))
+        data = self._post("/decide/batch", body)
+        parsed = _core.parse_batch([g.questions for g in groups], data)
+        return GroupsResult([{"items": items} for items in parsed], _core.batch_meta(data))
 
     def ready(self) -> bool:
-        """``GET /ready``: ``True`` on 200, ``False`` otherwise (503 = loading)."""
+        """``GET /ready``: ``True`` when Sage is serving. Never retried; network errors return ``False``."""
+        try:
+            return self._send("GET", "/ready", retry=False).status_code == 200
+        except LevantoError:
+            return False
 
-        response = self._request("GET", "/ready", retry_statuses=False)
-        return response.status_code == 200
-
-    # -- shortcuts (single only; return just the result payload) ---------- #
+    # Shortcuts: one question, returns only its ``result``.
 
     def yesno(
         self,
         document: Content,
         instructions: str,
         *,
-        id: Optional[str] = None,
-        grounding: Optional[Grounding] = None,
+        id: str | None = None,
+        grounding: Grounding | None = None,
+        reasoning: Reasoning | None = _UNSET,
     ) -> YesNoResult:
-        env = self.decide(document, YesNo(instructions, id=id, grounding=grounding))
-        return env["result"]  # type: ignore[return-value]
+        return self.decide(document, YesNo(instructions, id=id, grounding=grounding), reasoning=reasoning)["result"]  # type: ignore[return-value]
 
     def choice(
         self,
@@ -201,13 +172,12 @@ class LevantoClient:
         instructions: str,
         options: Sequence[OptionInput],
         *,
-        id: Optional[str] = None,
-        grounding: Optional[Grounding] = None,
+        id: str | None = None,
+        grounding: Grounding | None = None,
+        reasoning: Reasoning | None = _UNSET,
     ) -> ChoiceResult:
-        env = self.decide(
-            document, Choice(instructions, options, id=id, grounding=grounding)
-        )
-        return env["result"]  # type: ignore[return-value]
+        q = Choice(instructions, options, id=id, grounding=grounding)
+        return self.decide(document, q, reasoning=reasoning)["result"]  # type: ignore[return-value]
 
     def scale(
         self,
@@ -215,67 +185,56 @@ class LevantoClient:
         instructions: str,
         levels: Sequence[LevelInput],
         *,
-        id: Optional[str] = None,
-        grounding: Optional[Grounding] = None,
+        id: str | None = None,
+        grounding: Grounding | None = None,
+        reasoning: Reasoning | None = _UNSET,
     ) -> ScaleResult:
-        env = self.decide(
-            document, Scale(instructions, levels, id=id, grounding=grounding)
-        )
-        return env["result"]  # type: ignore[return-value]
+        q = Scale(instructions, levels, id=id, grounding=grounding)
+        return self.decide(document, q, reasoning=reasoning)["result"]  # type: ignore[return-value]
 
     def sort(
-        self,
-        items: Content,
-        instructions: str,
-        *,
-        id: Optional[str] = None,
+        self, items: Content, instructions: str, *, id: str | None = None, reasoning: Reasoning | None = _UNSET
     ) -> SortResult:
-        env = self.decide(items, Sort(instructions, id=id))
-        return env["result"]  # type: ignore[return-value]
+        return self.decide(items, Sort(instructions, id=id), reasoning=reasoning)["result"]  # type: ignore[return-value]
 
     def tags(
         self,
         document: Content,
         tags: Sequence[TagInput],
         *,
-        id: Optional[str] = None,
-        grounding: Optional[Grounding] = None,
-        instructions: Optional[str] = None,
+        instructions: str | None = None,
+        id: str | None = None,
+        grounding: Grounding | None = None,
+        reasoning: Reasoning | None = _UNSET,
     ) -> TagsResult:
-        env = self.decide(
-            document, Tags(tags, instructions=instructions, id=id, grounding=grounding)
-        )
-        return env["result"]  # type: ignore[return-value]
+        q = Tags(tags, instructions=instructions, id=id, grounding=grounding)
+        return self.decide(document, q, reasoning=reasoning)["result"]  # type: ignore[return-value]
 
 
-class AsyncLevantoClient:
-    """Asynchronous client for the Levanto Sage decision API.
-
-    Identical surface to :class:`LevantoClient`; every request method is a
-    coroutine.
-    """
+class AsyncLevantoClient(_Base):
+    """Async version of :class:`LevantoClient`: same methods, awaited."""
 
     def __init__(
         self,
-        api_key: str,
+        api_key: str | None = None,
         *,
-        base_url: str = DEFAULT_BASE_URL,
+        base_url: str = _core.DEFAULT_BASE_URL,
         timeout: float = 60.0,
         max_retries: int = 3,
-        transport: Optional[httpx.AsyncBaseTransport] = None,
+        reasoning: Reasoning | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
+        self._reasoning = reasoning
         self._max_retries = max_retries
-        self._client = httpx.AsyncClient(
+        self._http = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
             timeout=timeout,
-            headers=_http.default_headers(api_key),
+            headers=_core.headers(_api_key(api_key)),
             transport=transport,
         )
 
-    # -- lifecycle -------------------------------------------------------- #
-
     async def aclose(self) -> None:
-        await self._client.aclose()
+        await self._http.aclose()
 
     async def __aenter__(self) -> "AsyncLevantoClient":
         return self
@@ -283,97 +242,69 @@ class AsyncLevantoClient:
     async def __aexit__(self, *exc: Any) -> None:
         await self.aclose()
 
-    # -- transport -------------------------------------------------------- #
-
-    async def _request(
-        self,
-        method: str,
-        url: str,
-        *,
-        json: Any = None,
-        retry_statuses: bool = True,
-    ) -> httpx.Response:
+    async def _send(self, method: str, path: str, body: Any = None, *, retry: bool = True) -> httpx.Response:
         attempt = 0
         while True:
             try:
-                response = await self._client.request(method, url, json=json)
+                response = await self._http.request(method, path, json=body)
+            except httpx.TimeoutException as exc:
+                raise LevantoError(f"{method} {path} timed out: {exc}") from exc
             except httpx.TransportError as exc:
-                if attempt < self._max_retries:
-                    await asyncio.sleep(_http.backoff_delay(attempt))
+                if retry and attempt < self._max_retries:
+                    await asyncio.sleep(_core.backoff_delay(attempt))
                     attempt += 1
                     continue
-                # Wrap the raw httpx error so callers only ever see LevantoError
-                # (mirrors the JS client, which wraps transport failures too).
-                raise LevantoError(f"Request to {url} failed: {exc}") from exc
-            if retry_statuses and _http.should_retry(
-                response.status_code, attempt, self._max_retries
-            ):
-                await asyncio.sleep(_http.backoff_delay(attempt))
+                raise LevantoError(f"{method} {path} failed: {exc}") from exc
+            if retry and _core.should_retry(response.status_code, attempt, self._max_retries):
+                await asyncio.sleep(_core.backoff_delay(attempt, response))
                 attempt += 1
                 continue
             return response
 
-    # -- core ------------------------------------------------------------- #
+    async def _post(self, path: str, body: Dict[str, Any]) -> Any:
+        return _core.raise_for_status(await self._send("POST", path, body))
 
     @overload
-    async def decide(self, document: Content, question: Question) -> Envelope: ...
-
+    async def decide(self, document: Content, question: Question, *, reasoning: Reasoning | None = ...) -> Envelope: ...
     @overload
     async def decide(
-        self, document: Content, question: Sequence[Question]
-    ) -> List[BatchItem]: ...
-
-    async def decide(
-        self, document: Content, question: Union[Question, Sequence[Question]]
-    ) -> Union[Envelope, List[BatchItem]]:
+        self, document: Content, question: Sequence[Question], *, reasoning: Reasoning | None = ...
+    ) -> BatchResult: ...
+    async def decide(self, document: Content, question: Any, *, reasoning: Any = _UNSET) -> Any:
         """See :meth:`LevantoClient.decide`."""
+        if isinstance(question, (list, tuple)):
+            data = await self._post("/decide/batch", _core.build_batch_body([(document, question)], self._pick(reasoning)))
+            return BatchResult(_core.parse_batch([question], data)[0], _core.batch_meta(data))
+        return await self._post("/decide", _core.build_single_body(document, question, self._pick(reasoning)))
 
-        if _is_batch(question):
-            questions = list(question)  # type: ignore[arg-type]
-            body = _http.build_batch_body(document, questions)
-            response = await self._request("POST", "/decide/batch", json=body)
-            data = _http.handle_response(response)
-            return _http.parse_batch(questions, data)
-
-        body = _http.build_single_body(document, question)  # type: ignore[arg-type]
-        response = await self._request("POST", "/decide", json=body)
-        data = _http.handle_response(response)
-        return _http.parse_single(data)
-
-    async def decide_groups(self, groups: Sequence[Group]) -> List[GroupResult]:
+    async def decide_groups(
+        self, groups: Sequence[Group], *, reasoning: Reasoning | None = _UNSET
+    ) -> GroupsResult:
         """See :meth:`LevantoClient.decide_groups`."""
-
-        glist = list(groups)
-        body = _http.build_groups_body([(g.document, g.questions) for g in glist])
-        response = await self._request("POST", "/decide/batch", json=body)
-        data = _http.handle_response(response)
-        results = data.get("results", [])
-        out: List[GroupResult] = []
-        for i, g in enumerate(glist):
-            grp = results[i] if i < len(results) else {}
-            out.append({"items": _http.parse_group_answers(list(g.questions), grp)})
-        return out
+        groups = list(groups)
+        body = _core.build_batch_body([(g.document, g.questions) for g in groups], self._pick(reasoning))
+        data = await self._post("/decide/batch", body)
+        parsed = _core.parse_batch([g.questions for g in groups], data)
+        return GroupsResult([{"items": items} for items in parsed], _core.batch_meta(data))
 
     async def ready(self) -> bool:
         """See :meth:`LevantoClient.ready`."""
-
-        response = await self._request("GET", "/ready", retry_statuses=False)
-        return response.status_code == 200
-
-    # -- shortcuts -------------------------------------------------------- #
+        try:
+            return (await self._send("GET", "/ready", retry=False)).status_code == 200
+        except LevantoError:
+            return False
 
     async def yesno(
         self,
         document: Content,
         instructions: str,
         *,
-        id: Optional[str] = None,
-        grounding: Optional[Grounding] = None,
+        id: str | None = None,
+        grounding: Grounding | None = None,
+        reasoning: Reasoning | None = _UNSET,
     ) -> YesNoResult:
-        env = await self.decide(
-            document, YesNo(instructions, id=id, grounding=grounding)
-        )
-        return env["result"]  # type: ignore[return-value]
+        q = YesNo(instructions, id=id, grounding=grounding)
+        return (await self.decide(document, q, reasoning=reasoning))["result"]  # type: ignore[return-value]
 
     async def choice(
         self,
@@ -381,13 +312,12 @@ class AsyncLevantoClient:
         instructions: str,
         options: Sequence[OptionInput],
         *,
-        id: Optional[str] = None,
-        grounding: Optional[Grounding] = None,
+        id: str | None = None,
+        grounding: Grounding | None = None,
+        reasoning: Reasoning | None = _UNSET,
     ) -> ChoiceResult:
-        env = await self.decide(
-            document, Choice(instructions, options, id=id, grounding=grounding)
-        )
-        return env["result"]  # type: ignore[return-value]
+        q = Choice(instructions, options, id=id, grounding=grounding)
+        return (await self.decide(document, q, reasoning=reasoning))["result"]  # type: ignore[return-value]
 
     async def scale(
         self,
@@ -395,34 +325,27 @@ class AsyncLevantoClient:
         instructions: str,
         levels: Sequence[LevelInput],
         *,
-        id: Optional[str] = None,
-        grounding: Optional[Grounding] = None,
+        id: str | None = None,
+        grounding: Grounding | None = None,
+        reasoning: Reasoning | None = _UNSET,
     ) -> ScaleResult:
-        env = await self.decide(
-            document, Scale(instructions, levels, id=id, grounding=grounding)
-        )
-        return env["result"]  # type: ignore[return-value]
+        q = Scale(instructions, levels, id=id, grounding=grounding)
+        return (await self.decide(document, q, reasoning=reasoning))["result"]  # type: ignore[return-value]
 
     async def sort(
-        self,
-        items: Content,
-        instructions: str,
-        *,
-        id: Optional[str] = None,
+        self, items: Content, instructions: str, *, id: str | None = None, reasoning: Reasoning | None = _UNSET
     ) -> SortResult:
-        env = await self.decide(items, Sort(instructions, id=id))
-        return env["result"]  # type: ignore[return-value]
+        return (await self.decide(items, Sort(instructions, id=id), reasoning=reasoning))["result"]  # type: ignore[return-value]
 
     async def tags(
         self,
         document: Content,
         tags: Sequence[TagInput],
         *,
-        id: Optional[str] = None,
-        grounding: Optional[Grounding] = None,
-        instructions: Optional[str] = None,
+        instructions: str | None = None,
+        id: str | None = None,
+        grounding: Grounding | None = None,
+        reasoning: Reasoning | None = _UNSET,
     ) -> TagsResult:
-        env = await self.decide(
-            document, Tags(tags, instructions=instructions, id=id, grounding=grounding)
-        )
-        return env["result"]  # type: ignore[return-value]
+        q = Tags(tags, instructions=instructions, id=id, grounding=grounding)
+        return (await self.decide(document, q, reasoning=reasoning))["result"]  # type: ignore[return-value]
