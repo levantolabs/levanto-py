@@ -1,22 +1,15 @@
-"""Typed structures for the shapes the Sage API returns.
+"""Response types. At runtime every value is a plain ``dict`` (JSON as the API sends it).
 
-These are :class:`typing.TypedDict` definitions: at runtime the values are
-plain ``dict`` objects, but the annotations let type checkers understand the
-result payloads, response envelopes and batch items the client hands back.
-
-Optional keys are modelled with the base-class + ``total=False`` inheritance
-pattern so the SDK stays compatible with Python 3.9 (which lacks
-``typing.NotRequired``).
+Keys that the API may omit are declared on a ``total=False`` subclass.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional, Union
-from typing import TypedDict
+from typing import Any, Dict, List, Literal, TypedDict, Union
 
 __all__ = [
+    "Reasoning",
     "Content",
-    "Meta",
     "YesNoResult",
     "ChoiceProbability",
     "ChoiceResult",
@@ -25,111 +18,125 @@ __all__ = [
     "TagResult",
     "TagsResult",
     "Result",
+    "Usage",
+    "ReasoningMeta",
+    "Meta",
+    "Source",
+    "GroundingMeta",
     "Envelope",
     "BatchItem",
-    "BatchResponse",
     "GroupResult",
 ]
 
-# A document/content value accepted by the client before normalization.
-Content = Union[str, Dict[str, Any], List[Any]]
+Reasoning = Literal["auto", "off", "on"]
 
-
-class Meta(TypedDict):
-    """Per-response metadata block."""
-
-    model: str
-    latency_ms: float
+# What a ``document`` can be: text, a list of ``{"id", "content"}`` items (Sort),
+# an :class:`~levanto.Image`, or a raw wire ``content`` dict.
+Content = Union[str, List[Dict[str, Any]], Dict[str, Any], Any]
 
 
 class YesNoResult(TypedDict):
-    """Result payload for a ``yesno`` question."""
-
-    probability: float
-    confidence: float
-    answer: Literal["yes", "no"]
+    answer: Literal["yes", "no"] | None  # None: Sage isn't sure
+    probability: float  # calibrated P(yes)
 
 
 class ChoiceProbability(TypedDict):
-    """One option/probability pair inside a ``choice`` result."""
-
     option: str
     probability: float
 
 
 class ChoiceResult(TypedDict):
-    """Result payload for a ``choice`` question."""
-
-    chosen: str
-    confidence: float
-    probabilities: List[ChoiceProbability]
+    chosen: str | None  # None: the top options are too close to call
+    probability: float | None  # P(chosen is correct); None when chosen is None
+    probabilities: List[ChoiceProbability]  # every option, request order; independent, don't sum to 1
 
 
 class ScaleResult(TypedDict):
-    """Result payload for a ``scale`` question."""
-
-    expectation: float
+    expectation: float  # 0..4
     confidence: float
 
 
 class SortResult(TypedDict):
-    """Result payload for a ``sort`` question.
-
-    The API types ``confidence`` as nullable, so it must never be assumed to be
-    a number.
-    """
-
-    sorted: List[str]
-    confidence: Optional[float]
+    sorted: List[str]  # item ids, in order
+    confidence: float | None
 
 
-class _TagResultBase(TypedDict):
+class TagResult(TypedDict):
     id: str
-    probability: float
-    confidence: float
-
-
-class TagResult(_TagResultBase, total=False):
-    """One entry inside a ``tags`` result.
-
-    ``applies`` is a ``bool`` when the corresponding
-    :class:`~levanto.questions.TagSpec` carried a ``threshold``, otherwise
-    ``None``.
-    """
-
-    applies: Optional[bool]
+    probability: float  # calibrated P(tag applies)
+    applies: bool | None  # None: too close to call
 
 
 class TagsResult(TypedDict):
-    """Result payload for a ``tags`` question."""
-
     tags: List[TagResult]
 
 
-# Union over every result payload shape.
-Result = Union[
-    YesNoResult,
-    ChoiceResult,
-    ScaleResult,
-    SortResult,
-    TagsResult,
-]
+Result = Union[YesNoResult, ChoiceResult, ScaleResult, SortResult, TagsResult]
+
+
+class _UsageBase(TypedDict):
+    billed_input_tokens: int
+
+
+class Usage(_UsageBase, total=False):
+    rendered_tokens: int | None
+    image_count: int
+    image_tokens: int
+
+
+class _ReasoningMetaBase(TypedDict):
+    fired: bool  # the first pass signalled the question needs reasoning
+    ran: bool  # the reasoning pass executed
+
+
+class ReasoningMeta(_ReasoningMetaBase, total=False):
+    finished: bool | None  # False: the first-pass answer was returned; None: didn't run
+    tokens: int | None
+    margin: float | None
+    limited: Literal["cap", "timeout", "budget"] | None
+
+
+class _MetaBase(TypedDict):
+    model: str
+
+
+class Meta(_MetaBase, total=False):
+    latency_ms: float | None
+    question_count: int | None
+    compute_mode: str | None
+    usage: Usage | None
+    reasoning: ReasoningMeta | None  # omitted on kinds without a reasoning pass
+
+
+class Source(TypedDict, total=False):
+    url: str | None
+    title: str | None
+    snippet: str | None
+
+
+class _GroundingMetaBase(TypedDict):
+    triggered: bool
+
+
+class GroundingMeta(_GroundingMetaBase, total=False):
+    trigger_reason: str | None
+    queries: List[str]
+    sources: List[Source]
+    added_context_tokens: int | None
+    search_ms: float | None
 
 
 class _EnvelopeBase(TypedDict):
     id: str
-    kind: str
+    kind: Literal["yesno", "choice", "scale", "sort", "tags"]
     result: Result
     meta: Meta
 
 
 class Envelope(_EnvelopeBase, total=False):
-    """Full response envelope for a single decision.
+    """A ``/decide`` response. ``grounding_meta`` is present when grounding was requested."""
 
-    ``grounding_meta`` is present only when grounding (web search) ran.
-    """
-
-    grounding_meta: Dict[str, Any]
+    grounding_meta: GroundingMeta | None
 
 
 class _BatchItemBase(TypedDict):
@@ -139,34 +146,17 @@ class _BatchItemBase(TypedDict):
 
 
 class BatchItem(_BatchItemBase, total=False):
-    """One item of a batch decision, aligned to the input question order.
+    """One batch answer, in question order.
 
-    A successful item (``ok is True``) reads exactly like a single decide:
-    ``result`` is the bare payload (same shape as ``Envelope["result"]``), with
-    ``meta`` and, when grounding ran, ``grounding_meta`` alongside it. A failed
-    item (``ok is False``) carries ``error`` instead. On the wire the server
-    nests a full envelope under each item's ``result``; the client flattens it
-    so access matches a single decide.
+    ``ok=True``: reads like a single decide (``result``, ``meta``,
+    ``grounding_meta``). ``ok=False``: ``error`` says why.
     """
 
     result: Result
     meta: Meta
-    grounding_meta: Dict[str, Any]
+    grounding_meta: GroundingMeta | None
     error: str
 
 
-class BatchResponse(TypedDict):
-    """Wire shape of the ``POST /decide/batch`` response body."""
-
-    results: List[Dict[str, Any]]
-    meta: Dict[str, Any]
-
-
 class GroupResult(TypedDict):
-    """One group of a grouped batch (:meth:`LevantoClient.decide_groups`).
-
-    ``items`` are the flattened :class:`BatchItem`s for that group's questions,
-    in order, aligned to the input groups.
-    """
-
     items: List[BatchItem]

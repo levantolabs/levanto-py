@@ -1,17 +1,15 @@
-"""Exception types raised by the Levanto SDK.
+"""Errors raised by the SDK.
 
-Every error inherits from :class:`LevantoError` and carries the HTTP
-``status`` code and the server-supplied ``detail`` string (when available),
-so callers can branch on either the type or the fields.
+Every error is a :class:`LevantoError` carrying the HTTP ``status`` (``None``
+for network failures) and the server's ``detail`` message when there is one.
 """
 
 from __future__ import annotations
 
-from typing import Optional
-
 __all__ = [
     "LevantoError",
     "AuthError",
+    "AllowanceExhaustedError",
     "ValidationError",
     "ServiceUnavailableError",
     "LevantoAPIError",
@@ -19,35 +17,29 @@ __all__ = [
 
 
 class LevantoError(Exception):
-    """Base class for every error raised by this library."""
+    """Base class for every SDK error. Also raised for network failures and timeouts."""
 
-    def __init__(
-        self,
-        message: str,
-        *,
-        status: Optional[int] = None,
-        detail: Optional[str] = None,
-    ) -> None:
+    def __init__(self, message: str, *, status: int | None = None, detail: str | None = None) -> None:
         super().__init__(message)
         self.status = status
         self.detail = detail
 
 
 class AuthError(LevantoError):
-    """Authentication or billing failure (HTTP 401 / 402).
+    """HTTP 401: the API key is missing or invalid."""
 
-    Raised for a missing or invalid API key, or when the account balance is
-    too low to serve the request.
-    """
+
+class AllowanceExhaustedError(AuthError):
+    """HTTP 402: the key is valid, but this period's decision allowance is used up."""
 
 
 class ValidationError(LevantoError):
-    """The request was rejected as malformed (HTTP 400 / 422)."""
+    """HTTP 400/422: the request was rejected (schema, limits, or an unsupported combination)."""
 
 
 class ServiceUnavailableError(LevantoError):
-    """The Sage model is loading or otherwise unavailable (HTTP 503)."""
+    """HTTP 503 after retries: Sage is loading or temporarily unavailable."""
 
 
 class LevantoAPIError(LevantoError):
-    """Any other non-2xx response that is not covered by a more specific type."""
+    """Any other non-2xx response."""
