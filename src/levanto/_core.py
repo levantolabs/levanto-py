@@ -7,7 +7,7 @@ so the two clients cannot drift; each client only adds its own transport loop.
 from __future__ import annotations
 
 import random
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple, cast
 
 import httpx
 
@@ -21,7 +21,7 @@ from .errors import (
     ValidationError,
 )
 from .questions import Image, Question
-from .types import BatchItem, Content, Reasoning
+from .types import BatchItem, BatchMeta, Content, Reasoning
 
 USER_AGENT = f"levanto-python/{__version__}"
 DEFAULT_BASE_URL = "https://sage.levanto.ai"
@@ -96,6 +96,11 @@ def parse_group(questions: Sequence[Question], group: Dict[str, Any] | None) -> 
 def parse_batch(groups: Sequence[Sequence[Question]], data: Dict[str, Any]) -> List[List[BatchItem]]:
     results = data.get("results") or []
     return [parse_group(qs, results[i] if i < len(results) else None) for i, qs in enumerate(groups)]
+
+
+def batch_meta(data: Dict[str, Any]) -> BatchMeta:
+    """The call-level ``meta`` of a batch response (usage and latency live here)."""
+    return cast(BatchMeta, data.get("meta") or {})
 
 
 def _detail(response: httpx.Response) -> str | None:

@@ -18,11 +18,12 @@ from . import _core
 from .errors import LevantoError
 from .questions import Choice, Grounding, LevelInput, OptionInput, Question, Scale, Sort, Tags, TagInput, YesNo
 from .types import (
-    BatchItem,
+    BatchResult,
     ChoiceResult,
     Content,
     Envelope,
     GroupResult,
+    GroupsResult,
     Reasoning,
     ScaleResult,
     SortResult,
@@ -120,25 +121,30 @@ class LevantoClient(_Base):
     @overload
     def decide(
         self, document: Content, question: Sequence[Question], *, reasoning: Reasoning | None = ...
-    ) -> List[BatchItem]: ...
+    ) -> BatchResult: ...
     def decide(self, document: Content, question: Any, *, reasoning: Any = _UNSET) -> Any:
         """One question: ``POST /decide``, returns the :class:`Envelope`.
 
         A list of questions about the same document: one ``POST /decide/batch``
-        call (the document is sent once), returns a :class:`BatchItem` per
-        question, in order.
+        call (the document is sent once), returns a :class:`BatchResult`: one
+        :class:`BatchItem` per question, in order, plus the call's ``.meta``
+        (usage and latency are reported there, not per item).
         """
         if isinstance(question, (list, tuple)):
             data = self._post("/decide/batch", _core.build_batch_body([(document, question)], self._pick(reasoning)))
-            return _core.parse_batch([question], data)[0]
+            return BatchResult(_core.parse_batch([question], data)[0], _core.batch_meta(data))
         return self._post("/decide", _core.build_single_body(document, question, self._pick(reasoning)))
 
-    def decide_groups(self, groups: Sequence[Group], *, reasoning: Reasoning | None = _UNSET) -> List[GroupResult]:
-        """Several documents, each with its own questions, in one ``POST /decide/batch`` call."""
+    def decide_groups(self, groups: Sequence[Group], *, reasoning: Reasoning | None = _UNSET) -> GroupsResult:
+        """Several documents, each with its own questions, in one ``POST /decide/batch`` call.
+
+        Returns one :class:`GroupResult` per group, in order, plus the call's ``.meta``.
+        """
         groups = list(groups)
         body = _core.build_batch_body([(g.document, g.questions) for g in groups], self._pick(reasoning))
-        parsed = _core.parse_batch([g.questions for g in groups], self._post("/decide/batch", body))
-        return [{"items": items} for items in parsed]
+        data = self._post("/decide/batch", body)
+        parsed = _core.parse_batch([g.questions for g in groups], data)
+        return GroupsResult([{"items": items} for items in parsed], _core.batch_meta(data))
 
     def ready(self) -> bool:
         """``GET /ready``: ``True`` when Sage is serving. Never retried; network errors return ``False``."""
@@ -263,22 +269,23 @@ class AsyncLevantoClient(_Base):
     @overload
     async def decide(
         self, document: Content, question: Sequence[Question], *, reasoning: Reasoning | None = ...
-    ) -> List[BatchItem]: ...
+    ) -> BatchResult: ...
     async def decide(self, document: Content, question: Any, *, reasoning: Any = _UNSET) -> Any:
         """See :meth:`LevantoClient.decide`."""
         if isinstance(question, (list, tuple)):
-            body = _core.build_batch_body([(document, question)], self._pick(reasoning))
-            return _core.parse_batch([question], await self._post("/decide/batch", body))[0]
+            data = await self._post("/decide/batch", _core.build_batch_body([(document, question)], self._pick(reasoning)))
+            return BatchResult(_core.parse_batch([question], data)[0], _core.batch_meta(data))
         return await self._post("/decide", _core.build_single_body(document, question, self._pick(reasoning)))
 
     async def decide_groups(
         self, groups: Sequence[Group], *, reasoning: Reasoning | None = _UNSET
-    ) -> List[GroupResult]:
+    ) -> GroupsResult:
         """See :meth:`LevantoClient.decide_groups`."""
         groups = list(groups)
         body = _core.build_batch_body([(g.document, g.questions) for g in groups], self._pick(reasoning))
-        parsed = _core.parse_batch([g.questions for g in groups], await self._post("/decide/batch", body))
-        return [{"items": items} for items in parsed]
+        data = await self._post("/decide/batch", body)
+        parsed = _core.parse_batch([g.questions for g in groups], data)
+        return GroupsResult([{"items": items} for items in parsed], _core.batch_meta(data))
 
     async def ready(self) -> bool:
         """See :meth:`LevantoClient.ready`."""

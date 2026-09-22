@@ -82,3 +82,14 @@ async def test_groups_align_to_input(mode):
     out = await call(mode, Recorder((200, body)), "decide_groups", groups)
     assert [[(i["id"], i["kind"]) for i in g["items"]] for g in out] == [[("q0", "yesno")], [("q0", "choice"), ("tg", "tags")]]
     assert out[1]["items"][1]["result"] == samples.TAGS["result"]
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_batch_meta_is_kept(mode):
+    meta = {"model": "levanto-sage-v1.1", "request_count": 1, "question_count": 2, "latency_ms": 240.2,
+            "usage": {"billed_input_tokens": 14, "image_count": 1, "image_tokens": 65}}
+    body = samples.batch([samples.YESNO, samples.SCALE], meta=meta)
+    items = await call(mode, Recorder((200, body)), "decide", "doc", [YesNo("a"), Scale("b", LEVELS)])
+    assert items.meta == meta and len(items) == 2 and items[0]["ok"]
+    groups = await call(mode, Recorder((200, body)), "decide_groups", [Group("doc", [YesNo("a"), Scale("b", LEVELS)])])
+    assert groups.meta == meta and groups[0]["items"][1]["kind"] == "scale"

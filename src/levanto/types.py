@@ -26,6 +26,9 @@ __all__ = [
     "Envelope",
     "BatchItem",
     "GroupResult",
+    "BatchMeta",
+    "BatchResult",
+    "GroupsResult",
 ]
 
 Reasoning = Literal["auto", "off", "on"]
@@ -160,3 +163,36 @@ class BatchItem(_BatchItemBase, total=False):
 
 class GroupResult(TypedDict):
     items: List[BatchItem]
+
+
+class _BatchMetaBase(TypedDict):
+    model: str
+    request_count: int
+    question_count: int
+
+
+class BatchMeta(_BatchMetaBase, total=False):
+    """Call-level meta of a batch. Usage and latency are reported here, not per answer."""
+
+    latency_ms: float | None
+    usage: Usage | None
+
+
+class BatchResult(List[BatchItem]):
+    """The items of a batch ``decide``, in question order, plus the call's ``meta``."""
+
+    meta: BatchMeta
+
+    def __init__(self, items: List[BatchItem], meta: BatchMeta) -> None:
+        super().__init__(items)
+        self.meta = meta
+
+
+class GroupsResult(List[GroupResult]):
+    """One :class:`GroupResult` per group, in order, plus the call's ``meta``."""
+
+    meta: BatchMeta
+
+    def __init__(self, groups: List[GroupResult], meta: BatchMeta) -> None:
+        super().__init__(groups)
+        self.meta = meta

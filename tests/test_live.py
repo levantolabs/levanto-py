@@ -129,7 +129,8 @@ def test_batch_groups_with_image_and_sort(live):
     items = [item for group in out for item in group["items"]]
     assert all(item["ok"] for item in items), items
     assert [item["id"] for item in items] == ["q0", "urgency", "q0", "q0"]
-    assert out[2]["items"][0]["meta"]["usage"]["image_count"] == 1
+    # In a batch, usage is reported once for the call, not per answer.
+    assert out.meta["usage"]["image_count"] == 1 and out.meta["question_count"] == 4
 
 
 @needs_key

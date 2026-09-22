@@ -70,6 +70,8 @@ groups[1]["items"][0]["result"]
 
 A question that fails comes back with `ok=False` and `error`; the others still succeed. Unset ids default to `q0, q1, ...`.
 
+Both return a list with a `.meta` attribute: usage and latency for the whole call (`items.meta["usage"]`). They are reported there, not per item.
+
 ## Reasoning
 
 Sage v1.1 can think a hard question through before answering. `"auto"` (the server default) reasons only when the question needs it; `"off"` never does; `"on"` always does. Reasoning is not billed.
